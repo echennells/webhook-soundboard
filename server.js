@@ -1,187 +1,189 @@
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
-const { SparkWallet } = require('@buildonspark/spark-sdk');
+const WebSocket = require('ws');
+const http = require('http');
+const QRCode = require('qrcode');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Initialize Spark wallet
-let sparkWallet = null;
+// Create HTTP server
+const server = http.createServer(app);
 
-async function initializeWallet() {
-  try {
-    const { wallet, mnemonic } = await SparkWallet.initialize({
-      mnemonicOrSeed: process.env.SPARK_MNEMONIC,
-      options: {
-        network: process.env.SPARK_NETWORK || "FLASHNET", // Use FLASHNET for testnet, MAINNET for production
-      },
-    });
-
-    sparkWallet = wallet;
-
-    if (!process.env.SPARK_MNEMONIC) {
-      console.log('\n⚠️  IMPORTANT: Save this mnemonic to your .env file as SPARK_MNEMONIC:');
-      console.log(mnemonic);
-      console.log('');
-    }
-
-    console.log('✅ Spark wallet initialized');
-
-    // Get wallet info
-    const balance = await sparkWallet.getBalance();
-    console.log('💰 Wallet balance:', balance.confirmedSats, 'sats');
-
-    const sparkAddress = await sparkWallet.getSparkAddress();
-    console.log('📍 Spark address:', sparkAddress);
-
-  } catch (error) {
-    console.error('❌ Failed to initialize Spark wallet:', error);
-    process.exit(1);
-  }
-}
-
-// Start monitoring for payments
-async function monitorPayments() {
-  if (!sparkWallet) return;
-
-  try {
-    // Check for recent transfers
-    const transfersResponse = await sparkWallet.getTransfers(10, 0);
-    const transfers = transfersResponse?.transfers || [];
-
-    // Mark any pending payments as paid if we see a completed transfer
-    for (const [paymentId, payment] of pendingPayments.entries()) {
-      if (payment.paid) continue;
-
-      // Check if this payment hash appears in recent transfers with TRANSFER_COMPLETED status
-      const matchingTransfer = transfers.find(t =>
-        t.userRequest?.invoice?.paymentHash === payment.paymentHash &&
-        t.userRequest?.status === 'TRANSFER_COMPLETED'
-      );
-
-      if (matchingTransfer) {
-        payment.paid = true;
-        console.log(`✅ Payment received for ${SOUNDS.find(s => s.id === payment.soundId)?.name}`);
-        console.log(`   Amount: ${matchingTransfer.totalValue} sats`);
-      }
-    }
-  } catch (error) {
-    console.error('Error monitoring payments:', error.message);
-  }
-}
-
-// Poll for payments every 3 seconds
-setInterval(monitorPayments, 3000);
-
-initializeWallet();
+// Create WebSocket server
+const wss = new WebSocket.Server({ server });
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Available sounds
-const SOUNDS = [
-  { id: 'airhorn', name: 'Air Horn', file: 'airhorn.mp3' },
-  { id: 'drumroll', name: 'Drum Roll', file: 'drumroll.mp3' },
-  { id: 'tada', name: 'Ta-Da!', file: 'tada.mp3' },
-  { id: 'crickets', name: 'Crickets', file: 'crickets.mp3' },
-];
+// Available sounds mapped to amounts
+const SOUND_MAP = {
+  100: { id: 'airhorn', name: 'Air Horn', file: 'airhorn.mp3' },
+  200: { id: 'drumroll', name: 'Drum Roll', file: 'drumroll.mp3' },
+  300: { id: 'tada', name: 'Ta-Da!', file: 'tada.mp3' },
+  400: { id: 'crickets', name: 'Crickets', file: 'crickets.mp3' },
+};
 
-const PRICE_SATS = 100;
+// LNURL addresses (to be configured via .env)
+const LNURL_ADDRESSES = process.env.LNURL_ADDRESSES
+  ? process.env.LNURL_ADDRESSES.split(',').map(addr => addr.trim())
+  : ['lnurl1dp68gurn8ghj7um9wfmxjcm99e3k7mf0v9cxj0m385ekvcenxc6r2c35xvukxefcv5mkvv34x5ekzd3ev56nyd3hxqurzepexejxxepnxscrvwfnv9nxzcn9xq6xyefhvgcxxcmyxymnserxfq5fns'];
 
-// Store pending payments (in production, use a database)
-const pendingPayments = new Map();
+// Connect to payment service WebSocket
+const PAYMENT_WS_URL = process.env.PAYMENT_WS_URL || 'wss://tornode.brodie.rocks/api/v1/ws/XcYK345aEjsURLa8jwXT5j';
+let paymentWs = null;
 
-// API Routes
+function connectToPaymentService() {
+  console.log(`🔗 Connecting to payment service: ${PAYMENT_WS_URL}`);
 
-// Get available sounds
-app.get('/api/sounds', (req, res) => {
-  res.json(SOUNDS);
-});
+  paymentWs = new WebSocket(PAYMENT_WS_URL);
 
-// Create invoice for a sound
-app.post('/api/sounds/:soundId/invoice', async (req, res) => {
-  try {
-    const { soundId } = req.params;
-    const sound = SOUNDS.find(s => s.id === soundId);
+  paymentWs.on('open', () => {
+    console.log('✅ Connected to payment service WebSocket');
+  });
 
-    if (!sound) {
-      return res.status(404).json({ error: 'Sound not found' });
+  paymentWs.on('message', (data) => {
+    try {
+      const messageStr = data.toString();
+      console.log('📥 Payment WebSocket message received:', messageStr);
+
+      // Try to parse as JSON, if it fails, treat as plain text
+      let message;
+      try {
+        message = JSON.parse(messageStr);
+      } catch {
+        // Plain text message, treat as the amount directly
+        message = { message: messageStr };
+      }
+
+      handlePaymentNotification(message);
+    } catch (error) {
+      console.error('❌ Error handling payment message:', error);
     }
+  });
 
-    if (!sparkWallet) {
-      return res.status(503).json({ error: 'Wallet not initialized' });
-    }
+  paymentWs.on('close', () => {
+    console.log('❌ Payment WebSocket disconnected. Reconnecting in 5s...');
+    setTimeout(connectToPaymentService, 5000);
+  });
 
-    // Create Lightning invoice using Spark SDK
-    const invoiceResponse = await sparkWallet.createLightningInvoice({
-      amountSats: PRICE_SATS,
-      memo: `Spark Soundboard: ${sound.name}`,
-      expirySeconds: 300, // 5 minutes
-    });
+  paymentWs.on('error', (error) => {
+    console.error('❌ Payment WebSocket error:', error);
+  });
+}
 
-    const paymentId = `payment_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const encodedInvoice = invoiceResponse.invoice.encodedInvoice;
-    const paymentHash = invoiceResponse.invoice.paymentHash;
+// Handle payment notification from payment service
+function handlePaymentNotification(message) {
+  console.log('💳 Processing payment notification:', message);
 
-    // Store payment info
-    pendingPayments.set(paymentId, {
-      soundId,
-      encodedInvoice,
-      paymentHash,
-      paid: false,
-      createdAt: Date.now(),
-    });
+  // Extract the amount from the message - adjust based on actual payload structure
+  const messageText = message.message || message.amount || message.memo || message.comment || JSON.stringify(message);
+  console.log('📝 Message text:', messageText);
 
-    console.log(`📄 Created invoice for ${sound.name}`);
-    console.log(`   Payment hash: ${paymentHash}`);
-    console.log(`   Invoice: ${encodedInvoice.substring(0, 50)}...`);
+  // Extract the first number from the message
+  const match = messageText.toString().match(/^(\d+)/);
 
-    res.json({
-      paymentId,
-      invoice: encodedInvoice,
-      amountSats: PRICE_SATS,
-      soundId: sound.id,
-      soundName: sound.name,
-    });
-  } catch (error) {
-    console.error('Error creating invoice:', error);
-    res.status(500).json({ error: 'Failed to create invoice' });
-  }
-});
-
-// Check payment status
-app.get('/api/payments/:paymentId', (req, res) => {
-  const { paymentId } = req.params;
-  const payment = pendingPayments.get(paymentId);
-
-  if (!payment) {
-    return res.status(404).json({ error: 'Payment not found' });
+  if (!match) {
+    console.log('⚠️  No amount found in payment notification');
+    return;
   }
 
-  res.json({
-    paymentId,
-    soundId: payment.soundId,
-    paid: payment.paid,
+  const amount = parseInt(match[1]);
+  const sound = SOUND_MAP[amount];
+
+  if (!sound) {
+    console.log(`⚠️  No sound mapped for amount: ${amount}`);
+    return;
+  }
+
+  console.log(`🔊 Playing sound: ${sound.name} (${amount} sats)`);
+
+  // Broadcast to all connected browser clients
+  broadcast({
+    type: 'play-sound',
+    amount,
+    soundId: sound.id,
+    soundName: sound.name,
+    soundFile: sound.file
+  });
+}
+
+// Connect to payment service on startup
+connectToPaymentService();
+
+// WebSocket connection handler for browser clients
+wss.on('connection', (ws) => {
+  console.log('🔌 Browser client connected to WebSocket');
+
+  ws.on('close', () => {
+    console.log('🔌 Browser client disconnected from WebSocket');
+  });
+
+  ws.on('error', (error) => {
+    console.error('WebSocket error:', error);
   });
 });
 
-// Webhook for payment confirmation (from Spark)
-app.post('/api/webhooks/payment', (req, res) => {
-  // TODO: Verify webhook signature
-  const { paymentId } = req.body;
+// Broadcast to all connected WebSocket clients
+function broadcast(data) {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify(data));
+    }
+  });
+}
 
-  if (pendingPayments.has(paymentId)) {
-    pendingPayments.get(paymentId).paid = true;
-  }
+// API Routes
 
-  res.json({ success: true });
+// Get sound mapping
+app.get('/api/sounds', (req, res) => {
+  res.json(Object.entries(SOUND_MAP).map(([amount, sound]) => ({
+    amount: parseInt(amount),
+    ...sound
+  })));
 });
 
-app.listen(PORT, () => {
-  console.log(`🎵 Spark Soundboard server running on http://localhost:${PORT}`);
-  console.log(`💰 Price per sound: ${PRICE_SATS} sats`);
+// Get LNURL addresses
+app.get('/api/lnurl', (req, res) => {
+  res.json({ addresses: LNURL_ADDRESSES });
+});
+
+// Generate QR code for an LNURL address
+app.get('/api/qr/:index', async (req, res) => {
+  try {
+    const index = parseInt(req.params.index) || 0;
+    const address = LNURL_ADDRESSES[index];
+
+    if (!address) {
+      return res.status(404).json({ error: 'LNURL address not found' });
+    }
+
+    const qrCode = await QRCode.toDataURL(address.toUpperCase(), {
+      width: 512,
+      margin: 2,
+      color: {
+        dark: '#000000',
+        light: '#FFFFFF'
+      }
+    });
+
+    res.json({ qrCode, address });
+  } catch (error) {
+    console.error('Error generating QR code:', error);
+    res.status(500).json({ error: 'Failed to generate QR code' });
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`🎵 Webhook Soundboard server running on http://localhost:${PORT}`);
+  console.log(`🔌 WebSocket server ready`);
+  console.log(`📱 LNURL addresses configured: ${LNURL_ADDRESSES.length}`);
+  console.log(`\nSound mapping:`);
+  Object.entries(SOUND_MAP).forEach(([amount, sound]) => {
+    console.log(`  ${amount} sats → ${sound.name}`);
+  });
 });
